@@ -1,0 +1,661 @@
+---
+title: "Midterm Code Report: NYT Surveillance Corpus Analysis"
+subtitle: "SIS/ITEC 724 — Spring 2026 — Professor Cogburn"
+author: "Daniel Chavez"
+date: today
+format:
+  pdf:
+    titlepage: true
+    toc: true
+    toc-depth: 2
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+```{r}
+#| label: setup
+#| echo: false
+library(reticulate)
+# use_condaenv("/Users/chavez/miniconda3/envs/YOURENV", required = TRUE)
+```
+
+# CRISP-DM Step 1: Business/Research Understanding
+
+# Project Overview
+
+# Longitudinal analysis of NYT surveillance coverage (1995–2025),
+# comparing U.S. and PRC government surveillance framing across ~13,000 articles.
+# Data exported from ProQuest TDM Studio as two CSV files.
+
+# Disaggregated Research Questions (per Assignment 6 feedback):
+#
+# RQ1: Longitudinal sentiment trends
+#   RQ1.1: What is the overall trajectory of sentiment toward government
+#          surveillance in NYT coverage from 1995–2025? (Bing lexicon, loess trend)
+#   RQ1.2: Do VADER scores converge with dictionary-based results,
+#          validating the trend? (VADER triangulation)
+#
+# RQ2: Dominant frames and themes
+#   RQ2.1: What are the most frequent terms and bigrams characterizing
+#          surveillance coverage? (word freq, n-grams, TF-IDF — inductive/MVP core)
+#   RQ2.2: What latent topics emerge from LDA modeling, and how do topic
+#          proportions shift across eras? (LDA — elective extension)
+#   RQ2.3: What emotional frames (NRC emotions) dominate coverage? (NRC lexicon)
+#
+# RQ3: U.S. vs. PRC framing differences
+#   RQ3.1: Which words statistically distinguish U.S. from PRC coverage?
+#          (quanteda keyness/chi-squared — elective extension)
+#   RQ3.2: How do sentiment trajectories differ between the two corpora?
+#          (comparative sentiment — MVP core deductive)
+#   RQ3.3: Does the semantic neighborhood of "surveillance" differ across
+#          corpora? (GloVe + Word2Vec embeddings — elective extension)
+#
+# RQ4: Event-driven shifts
+#   RQ4.1: How did publication volume and sentiment shift around 9/11 (2001)
+#          and the Snowden revelations (2013)? (event-window analysis)
+#   RQ4.2: How did the emergence of AI-enabled surveillance (~2017) correspond
+#          with changes in vocabulary and tone? (keyword tracking, embeddings)
+
+# CRISP-DM Step 2: Data Understanding & Collection
+
+# Part 1: Environment Setup
+# ---------------------------------------------------------------
+# Loads R packages across three text mining ecosystems (tm, tidytext,
+# quanteda) plus visualization, embeddings, and Python bridge.
+
+## Deliverable 1: Install R Packages
+```{r}
+#| label: install-r-packages
+#| eval: false
+
+install.packages(c("tidytext", "tm", "quanteda", "quanteda.textplots",
+                    "quanteda.textstats", "tidyverse", "scales",
+                    "textdata", "topicmodels", "text2vec"))
+```
+
+## Deliverable 2: Load R Libraries
+```{r}
+#| label: load-r-libraries
+
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(quanteda)
+library(quanteda.textplots)
+library(quanteda.textstats)
+library(scales)
+```
+
+## Deliverable 3: Verify Python Environment
+```{r}
+#| label: check-python
+reticulate::py_config()
+```
+```{python}
+#| label: python-imports
+
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
+
+import nltk
+nltk.download("stopwords", quiet=True)
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+nltk.download("vader_lexicon", quiet=True)
+
+from nltk.corpus import stopwords
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+print("Python environment verified successfully.")
+print(f"NumPy version: {np.__version__}")
+```
+
+# Part 2: Data Import
+# ---------------------------------------------------------------
+# Data exported from ProQuest TDM Studio as two CSV files stored
+# in the Data/ subdirectory. Each row = one article with full text
+# and metadata. Combined into a single dataframe with corpus tag
+# and four analytical eras defined in the conceptual framework.
+# Corpus: ~7,621 U.S. articles + ~5,391 PRC articles = ~13,012 total.
+
+## Deliverable 4: Load CSV Data
+
+# Reads both CSVs, tags corpus of origin, combines, and creates
+# year and era variables. Column names may need adjustment after
+# inspecting actual CSV headers — check with head() or colnames().
+```{r}
+#| label: load-data
+
+us_raw  <- read_csv("Data/NYT US Sentiment.csv", show_col_types = FALSE)
+prc_raw <- read_csv("Data/NYT China Sentiment extended.csv", show_col_types = FALSE)
+
+# Tag corpus of origin
+us_raw$corpus  <- "US"
+prc_raw$corpus <- "PRC"
+
+# Combine and build text field from Title + Subject Terms
+# Date column is already parsed as date type by read_csv
+sample_corpus <- bind_rows(us_raw, prc_raw) %>%
+  mutate(
+    doc_id   = paste0(corpus, "_", GOID),
+    pub_date = Date,
+    year     = year(pub_date),
+    # Combine Title + Subject Terms into a single text field
+    # Subject Terms arrive as "['term1', 'term2']" — clean the brackets/quotes
+    clean_subjects = str_remove_all(`Subject Terms`, "\\[|\\]|'"),
+    fulltext = paste(Title, clean_subjects, sep = " "),
+    fulltext = str_squish(fulltext),
+    era = case_when(
+      year < 2001 ~ "Pre-9/11",
+      year >= 2001 & year < 2013 ~ "Post-9/11",
+      year >= 2013 & year < 2017 ~ "Post-Snowden",
+      year >= 2017 ~ "AI Era"
+    ),
+    era = factor(era, levels = c("Pre-9/11", "Post-9/11", "Post-Snowden", "AI Era"))
+  ) %>%
+  filter(!is.na(fulltext), fulltext != "")
+
+cat(sprintf("Combined corpus: %d documents (%d US, %d PRC)\n",
+            nrow(sample_corpus),
+            sum(sample_corpus$corpus == "US"),
+            sum(sample_corpus$corpus == "PRC")))
+cat(sprintf("Year range: %d – %d\n", min(sample_corpus$year), max(sample_corpus$year)))
+```
+
+# CRISP-DM Step 3: Data Preparation
+
+# Part 3: Preprocessing
+# ---------------------------------------------------------------
+# Tokenization, stopword removal, custom surveillance-specific
+# stopword dictionary. All downstream analyses depend on this step.
+
+## Deliverable 5: Tokenize and Remove Stopwords
+
+# Breaks articles into unigrams. Removes standard English stopwords
+# plus custom list of high-frequency NYT noise terms.
+# Filters to alphabetic tokens, 2+ characters.
+# Supports: all RQs.
+```{r}
+#| label: tokenize
+
+custom_stops <- tibble(word = c("said", "new", "york", "times", "mr", "ms",
+                                "also", "would", "could", "one", "two",
+                                "like", "just", "even", "say", "says",
+                                "article", "percent", "year", "years"))
+
+tokens <- sample_corpus %>%
+  unnest_tokens(word, fulltext) %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stops, by = "word") %>%
+  filter(str_detect(word, "^[a-z]{2,}$"))
+
+cat(sprintf("Total tokens after preprocessing: %s\n", comma(nrow(tokens))))
+cat(sprintf("Unique vocabulary: %s terms\n", comma(n_distinct(tokens$word))))
+```
+
+# CRISP-DM Step 4: Modeling
+
+# Part 4: Inductive Analysis — MVP Core (RQ2.1)
+# ---------------------------------------------------------------
+
+## Deliverable 6: Word Frequencies
+
+# Answers RQ2.1 — dominant vocabulary per corpus.
+# Technique: unigram frequency counts grouped by corpus.
+# Viz: horizontal bar chart, faceted US vs. PRC, top 15 terms.
+```{r}
+#| label: word-freq
+
+word_counts <- tokens %>%
+  count(corpus, word, sort = TRUE)
+
+top_words <- word_counts %>%
+  group_by(corpus) %>%
+  slice_max(n, n = 15) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, corpus))
+
+ggplot(top_words, aes(x = n, y = word, fill = corpus)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ corpus, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Top 15 Most Frequent Words by Corpus",
+       subtitle = "After stopword removal | NYT Surveillance Corpus",
+       x = "Frequency", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+## Deliverable 7: Bigram Analysis
+
+# Answers RQ2.1 — multi-word frames (e.g., "facial recognition,"
+# "social credit," "national security").
+# Technique: bigram tokenization, stopword filter on both positions.
+# Viz: faceted bar chart, top 10 bigrams per corpus.
+```{r}
+#| label: bigrams
+
+bigrams <- sample_corpus %>%
+  unnest_tokens(bigram, fulltext, token = "ngrams", n = 2) %>%
+  separate(bigram, into = c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% stop_words$word,
+         !word2 %in% stop_words$word,
+         !word1 %in% custom_stops$word,
+         !word2 %in% custom_stops$word) %>%
+  unite(bigram, word1, word2, sep = " ")
+
+top_bigrams <- bigrams %>%
+  count(corpus, bigram, sort = TRUE) %>%
+  group_by(corpus) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(bigram = reorder_within(bigram, n, corpus))
+
+ggplot(top_bigrams, aes(x = n, y = bigram, fill = corpus)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ corpus, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Top 10 Bigrams by Corpus",
+       subtitle = "Two-word phrases reveal dominant surveillance frames",
+       x = "Frequency", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+## Deliverable 8: TF-IDF Analysis
+
+# Answers RQ2.1, bridges to RQ3.1 — distinctively important words
+# per corpus (not just frequent). Down-weights common terms.
+# Technique: bind_tf_idf() on corpus-level word counts.
+# Viz: faceted bar chart, top 10 TF-IDF terms per corpus.
+```{r}
+#| label: tf-idf
+
+corpus_tfidf <- tokens %>%
+  count(corpus, word) %>%
+  bind_tf_idf(word, corpus, n) %>%
+  arrange(desc(tf_idf))
+
+top_tfidf <- corpus_tfidf %>%
+  group_by(corpus) %>%
+  slice_max(tf_idf, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, tf_idf, corpus))
+
+ggplot(top_tfidf, aes(x = tf_idf, y = word, fill = corpus)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ corpus, scales = "free_y") +
+  scale_y_reordered() +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Top TF-IDF Terms by Corpus",
+       subtitle = "Words that most distinguish U.S. from PRC coverage",
+       x = "TF-IDF Score", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+# Part 5: Deductive Analysis — MVP Core (RQ1, RQ3.2)
+# ---------------------------------------------------------------
+
+## Deliverable 9: Bing Lexicon Sentiment Scoring
+
+# Answers RQ1.1 and RQ3.2 — binary pos/neg via Bing lexicon.
+# Computes article-level net sentiment and ratio.
+# Wrangling: inner_join with Bing, pivot wide, compute scores.
+# Note: Bing is binary; no intensity or negation handling.
+```{r}
+#| label: bing-sentiment
+
+bing <- get_sentiments("bing")
+
+sentiment_by_article <- tokens %>%
+  inner_join(bing, by = "word") %>%
+  count(doc_id, corpus, year, era, sentiment) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  mutate(net_sentiment = positive - negative,
+         total_words = positive + negative,
+         sentiment_ratio = net_sentiment / total_words)
+
+cat(sprintf("Articles with sentiment data: %d of %d\n",
+            n_distinct(sentiment_by_article$doc_id),
+            nrow(sample_corpus)))
+```
+
+## Deliverable 10: Longitudinal Sentiment Trend (RQ1.1)
+
+# Mean net sentiment per year, smoothed via loess.
+# Viz: scatter + loess by corpus, vertical lines at 9/11, Snowden, AI era.
+# Point size = article count; sparse years have wider CIs.
+```{r}
+#| label: sentiment-trend
+
+yearly_sentiment <- sentiment_by_article %>%
+  group_by(year, corpus) %>%
+  summarize(
+    mean_sentiment = mean(sentiment_ratio, na.rm = TRUE),
+    n_articles = n(),
+    .groups = "drop"
+  )
+
+ggplot(yearly_sentiment, aes(x = year, y = mean_sentiment, color = corpus)) +
+  geom_point(aes(size = n_articles), alpha = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = c(2001, 2013, 2017), linetype = "dotted",
+             color = "gray40", linewidth = 0.5) +
+  ggplot2::annotate("text", x = 2001, y = max(yearly_sentiment$mean_sentiment, na.rm = TRUE),
+           label = "9/11", hjust = -0.2, size = 3) +
+  ggplot2::annotate("text", x = 2013, y = max(yearly_sentiment$mean_sentiment, na.rm = TRUE),
+           label = "Snowden", hjust = -0.2, size = 3) +
+  ggplot2::annotate("text", x = 2017, y = max(yearly_sentiment$mean_sentiment, na.rm = TRUE),
+           label = "AI Era", hjust = -0.2, size = 3) +
+  scale_color_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Longitudinal Sentiment Trends (RQ1.1)",
+       subtitle = "Bing lexicon | Dotted lines mark key inflection points",
+       x = "Year", y = "Mean Net Sentiment Ratio",
+       color = "Corpus", size = "N Articles") +
+  theme_minimal(base_size = 11)
+```
+
+## Deliverable 11: Sentiment by Era (RQ3.2, RQ4.1)
+
+# Compares mean sentiment between US and PRC across four eras.
+# Viz: grouped bar chart with standard error bars.
+```{r}
+#| label: sentiment-era
+
+era_sentiment <- sentiment_by_article %>%
+  group_by(era, corpus) %>%
+  summarize(
+    mean_sentiment = mean(sentiment_ratio, na.rm = TRUE),
+    sd_sentiment   = sd(sentiment_ratio, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(era_sentiment, aes(x = era, y = mean_sentiment, fill = corpus)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+  geom_errorbar(
+    aes(ymin = mean_sentiment - sd_sentiment / sqrt(n),
+        ymax = mean_sentiment + sd_sentiment / sqrt(n)),
+    position = position_dodge(width = 0.7), width = 0.2
+  ) +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Mean Sentiment by Era and Corpus (RQ3.2, RQ4.1)",
+       subtitle = "Error bars show standard error of the mean",
+       x = NULL, y = "Mean Net Sentiment Ratio", fill = "Corpus") +
+  theme_minimal(base_size = 11)
+```
+
+## Deliverable 12: VADER Sentiment in Python (RQ1.2)
+
+# Triangulates Bing with VADER compound scores.
+# VADER handles negation and intensifiers better than unigram lexicons.
+# Convergence between Bing and VADER strengthens RQ1 findings.
+```{python}
+#| label: vader-sentiment
+
+import pandas as pd
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+sid = SentimentIntensityAnalyzer()
+corpus_data = pd.DataFrame(r.sample_corpus)
+
+vader_scores = []
+for idx, row in corpus_data.iterrows():
+    scores = sid.polarity_scores(str(row['fulltext']))
+    vader_scores.append({
+        'doc_id':   row['doc_id'],
+        'corpus':   row['corpus'],
+        'year':     int(row['year']),
+        'compound': scores['compound'],
+        'pos':      scores['pos'],
+        'neg':      scores['neg'],
+        'neu':      scores['neu']
+    })
+
+print(f"VADER scored {len(vader_scores)} documents.")
+print(f"Mean compound (US):  {sum(s['compound'] for s in vader_scores if s['corpus']=='US') / max(1, sum(1 for s in vader_scores if s['corpus']=='US')):.3f}")
+print(f"Mean compound (PRC): {sum(s['compound'] for s in vader_scores if s['corpus']=='PRC') / max(1, sum(1 for s in vader_scores if s['corpus']=='PRC')):.3f}")
+```
+```{r}
+#| label: vader-to-r
+
+vader_df <- py$vader_scores %>%
+  bind_rows() %>%
+  mutate(year = as.integer(year))
+
+vader_yearly <- vader_df %>%
+  group_by(year, corpus) %>%
+  summarize(mean_compound = mean(compound, na.rm = TRUE),
+            n = n(), .groups = "drop")
+
+ggplot(vader_yearly, aes(x = year, y = mean_compound, color = corpus)) +
+  geom_point(aes(size = n), alpha = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "VADER Compound Sentiment Over Time (RQ1.2)",
+       subtitle = "Python VADER via reticulate | Triangulation with Bing",
+       x = "Year", y = "Mean VADER Compound Score",
+       color = "Corpus", size = "N Articles") +
+  theme_minimal(base_size = 11)
+```
+
+# Part 6: Elective Extensions
+
+## Deliverable 13–14: Quanteda Keyness (RQ3.1)
+
+# Chi-squared keyness identifies words used significantly more in
+# one corpus than the other. Accounts for corpus size imbalance
+# (7,621 vs 5,391) via expected vs. observed frequencies.
+# Viz: textplot_keyness, top 15 terms, blue=US, red=PRC.
+```{r}
+#| label: quanteda-dfm
+
+library(text2vec)
+
+qcorp <- corpus(sample_corpus, text_field = "fulltext",
+                docid_field = "doc_id")
+
+qtoks <- tokens(qcorp, remove_punct = TRUE, remove_numbers = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(c(stopwords("en"), custom_stops$word))
+
+qdfm <- dfm(qtoks)
+
+cat(sprintf("DFM dimensions: %d documents × %d features\n",
+            nrow(qdfm), ncol(qdfm)))
+```
+```{r}
+#| label: keyness
+
+dfm_grouped <- dfm_group(qdfm, groups = corpus)
+keyness_results <- textstat_keyness(dfm_grouped, target = "US")
+
+textplot_keyness(keyness_results, n = 15,
+                 color = c("#2166AC", "#B2182B")) +
+  labs(title = "Keyness: U.S. vs. PRC Surveillance Vocabulary (RQ3.1)",
+       subtitle = "Chi-squared test | Blue = U.S. | Red = PRC")
+```
+
+## Deliverable 15–16: GloVe Embeddings in R (RQ3.3, RQ4.2)
+
+# Captures semantic relationships beyond frequency. Queries nearest
+# neighbors for "surveillance" to see concept clustering.
+# Technique: text2vec TCM + GlobalVectors, rank=50, window=5.
+# With full data: train per-corpus and per-era models to measure
+# semantic drift (RQ4.2).
+```{r}
+#| label: glove-embeddings
+
+t2v_tokens <- sample_corpus$fulltext %>%
+  tolower() %>%
+  word_tokenizer()
+
+it <- itoken(t2v_tokens, progressbar = FALSE)
+vocab <- create_vocabulary(it) %>%
+  prune_vocabulary(term_count_min = 3)
+vectorizer <- vocab_vectorizer(vocab)
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 5L)
+
+glove_model <- GlobalVectors$new(rank = 50, x_max = 10)
+word_vectors <- glove_model$fit_transform(tcm, n_iter = 20,
+                                           convergence_tol = 0.01)
+
+cat(sprintf("GloVe embeddings: %d words × %d dimensions\n",
+            nrow(word_vectors), ncol(word_vectors)))
+```
+```{r}
+#| label: similar-words
+
+if ("surveillance" %in% rownames(word_vectors)) {
+  target_vec <- word_vectors["surveillance", , drop = FALSE]
+  cos_sims <- sim2(x = word_vectors, y = target_vec,
+                   method = "cosine", norm = "l2")
+  nearest <- sort(drop(cos_sims[,1]), decreasing = TRUE)
+
+  cat("Top 10 words most similar to 'surveillance':\n")
+  print(head(names(nearest)[names(nearest) != "surveillance"], 10))
+} else {
+  cat("'surveillance' not in vocabulary (try with full corpus).\n")
+}
+```
+
+## Deliverable 17: Word2Vec in Python (RQ3.3)
+
+# Second embedding method for triangulation with GloVe.
+# Technique: gensim Word2Vec skip-gram, dim=50, window=5.
+# With full data: train per-corpus models, compare neighbors.
+```{python}
+#| label: word2vec
+
+from gensim.models import Word2Vec
+import math
+
+corpus_data = r.sample_corpus
+
+stop = set(__import__('nltk').corpus.stopwords.words("english"))
+documents = []
+for text in corpus_data['fulltext']:
+    words = [w.lower() for w in str(text).split() if w.isalpha() and w.lower() not in stop]
+    if words:
+        documents.append(words)
+
+model = Word2Vec(
+    sentences=documents,
+    vector_size=50,
+    window=5,
+    min_count=2,
+    workers=1,
+    sg=1,
+    negative=10,
+    epochs=10
+)
+
+kv = model.wv
+print(f"Word2Vec vocab size: {len(kv)}")
+
+def cosine_py(a, b):
+    num = sum(x*y for x, y in zip(a, b))
+    den = math.sqrt(sum(x*x for x in a)) * math.sqrt(sum(y*y for y in b))
+    return (num / den) if den else 0.0
+
+if "surveillance" in kv.key_to_index:
+    q = kv.get_vector("surveillance").tolist()
+    sims = []
+    for w in kv.key_to_index.keys():
+        if w == "surveillance":
+            continue
+        v = kv.get_vector(w).tolist()
+        sims.append((w, cosine_py(q, v)))
+    sims.sort(key=lambda x: x[1], reverse=True)
+    print("\nWords most similar to 'surveillance' (Word2Vec):")
+    for word, score in sims[:10]:
+        print(f"  {word}: {score:.3f}")
+```
+
+# CRISP-DM Step 5: Evaluation
+
+# Part 7: Publication Volume & Emotion Analysis (RQ4, RQ2.3)
+
+## Deliverable 18: Article Volume Over Time (RQ4.1, RQ4.2)
+
+# Tracks coverage volume as proxy for editorial attention.
+# Volume spikes around events = initial evidence for RQ4.
+# Viz: stacked area chart with event marker lines.
+```{r}
+#| label: volume-over-time
+
+volume <- sample_corpus %>%
+  count(year, corpus)
+
+ggplot(volume, aes(x = year, y = n, fill = corpus)) +
+  geom_area(alpha = 0.6, position = "stack") +
+  geom_vline(xintercept = c(2001, 2013, 2017), linetype = "dotted",
+             color = "gray30") +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "Publication Volume Over Time (RQ4.1, RQ4.2)",
+       subtitle = "Stacked area | Dotted lines mark 9/11, Snowden, AI Era onset",
+       x = "Year", y = "Number of Articles", fill = "Corpus") +
+  theme_minimal(base_size = 11)
+```
+
+## Deliverable 19: NRC Emotion Analysis (RQ2.3)
+
+# NRC lexicon classifies words into 8 emotions. Reveals which
+# emotional frames dominate each corpus.
+# Viz: grouped horizontal bar chart, US vs. PRC.
+# Note: NRC license must be accepted interactively on first run.
+```{r}
+#| label: nrc-emotions
+#| eval: false
+
+# First run: accept NRC license interactively via get_sentiments("nrc")
+# Then set eval: true
+
+nrc <- get_sentiments("nrc") %>%
+  filter(!sentiment %in% c("positive", "negative"))
+
+emotion_counts <- tokens %>%
+  inner_join(nrc, by = "word") %>%
+  count(corpus, sentiment, sort = TRUE)
+
+ggplot(emotion_counts, aes(x = reorder(sentiment, n), y = n, fill = corpus)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("US" = "#2166AC", "PRC" = "#B2182B")) +
+  labs(title = "NRC Emotion Profiles by Corpus (RQ2.3)",
+       subtitle = "Which emotional frames dominate each corpus?",
+       x = NULL, y = "Word Count", fill = "Corpus") +
+  theme_minimal(base_size = 11)
+```
+
+# CRISP-DM Step 6: Deployment (Next Steps)
+
+# Conclusion and Next Steps
+#
+# MVP Core (Completed):
+#   - Word frequency (Deliverable 6) → RQ2.1
+#   - Bigrams (Deliverable 7) → RQ2.1
+#   - TF-IDF (Deliverable 8) → RQ2.1, RQ3.1
+#   - Bing sentiment (Deliverables 9–11) → RQ1.1, RQ3.2, RQ4.1
+#   - Data visualizations throughout
+#
+# Elective Extensions (In Progress):
+#   - VADER sentiment (Deliverable 12) → RQ1.2
+#   - Quanteda keyness (Deliverables 13–14) → RQ3.1
+#   - GloVe embeddings (Deliverables 15–16) → RQ3.3, RQ4.2
+#   - Word2Vec embeddings (Deliverable 17) → RQ3.3
+#   - NRC emotion profiling (Deliverable 19) → RQ2.3
+#
+# Remaining for Final:
+#   1. Add LDA topic modeling for RQ2.2 (test k = 5, 10, 15, 20)
+#   2. Implement event-window analysis for RQ4.1 (12-month before/after)
+#   3. Test multiple AI-era cutoffs (2015, 2017, 2019) for RQ4.2
+#   4. Normalize comparative analyses for corpus size imbalance
+#   5. Build GitHub repo for reproducibility
+
+
